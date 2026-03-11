@@ -106,23 +106,29 @@ class HidenCloudBot {
         this.logMsg.push(msg);
     }
 
+    // Wrap fetch inside the browser context
     async request(method, url, data = null, extraHeaders = {}) {
+        // Construct full URL if needed
         const targetUrl = url.startsWith('http') ? url : `https://dash.hidencloud.com${url.startsWith('/') ? '' : '/'}${url}`;
 
+        // Prepare Headers - Browser handles User-Agent, Cookie, Host, etc.
+        // We only add specific functional headers
         const headers = { ...extraHeaders };
         if (method === 'POST' && !headers['Content-Type']) {
             headers['Content-Type'] = 'application/x-www-form-urlencoded';
         }
+        // CSRF Token if we have it
         if (this.csrfToken && !headers['X-CSRF-TOKEN']) {
             headers['X-CSRF-TOKEN'] = this.csrfToken;
         }
 
         try {
+            // Execute fetch inside the browser
             const result = await this.page.evaluate(async ({ url, method, data, headers }) => {
                 const options = {
                     method: method,
                     headers: headers,
-                    redirect: 'follow'
+                    redirect: 'follow' // Let browser verify redirects automatically
                 };
                 if (data) options.body = data;
 
@@ -131,12 +137,13 @@ class HidenCloudBot {
 
                 return {
                     status: res.status,
-                    url: res.url,
-                    headers: {},
+                    url: res.url, // Final URL after redirects
+                    headers: {}, // We can't iterate headers easily in all browsers, but usually not needed for logic if we trust auto-redirects
                     data: text
                 };
             }, { url: targetUrl, method, data: data ? data.toString() : null, headers });
 
+            // Normalize result to match our previous axios structure
             result.finalUrl = result.url;
             return result;
         } catch (err) {
@@ -152,9 +159,10 @@ class HidenCloudBot {
     async init() {
         this.log('🔍 正在验证 API 登录状态 (Browser Mode)...');
         try {
-            await sleep(2000);
+            await sleep(2000); // Wait a bit
             const res = await this.request('GET', '/dashboard');
 
+            // Check for login redirection
             if (res.finalUrl.includes('/login') || res.finalUrl.includes('/auth')) {
                 this.log('❌ 浏览器似乎未保持登录状态');
                 return false;
@@ -171,6 +179,7 @@ class HidenCloudBot {
 
             this.extractTokens($);
 
+            // Parse Services
             $('a[href*="/service/"]').each((i, el) => {
                 const href = $(el).attr('href');
                 const match = href.match(/\/service\/(\d+)\/manage/);
@@ -178,6 +187,7 @@ class HidenCloudBot {
                     this.services.push({ id: match[1], url: href });
                 }
             });
+            // deduplicate
             this.services = this.services.filter((v, i, a) => a.findIndex(t => t.id === v.id) === i);
 
             this.log(`✅ API 连接成功，发现 ${this.services.length} 个服务`);
@@ -287,6 +297,8 @@ class HidenCloudBot {
         this.log(`💳 提交支付...`);
 
         try {
+            // No Referer needed for Browser Fetch (it handles it, or we rely on standard behavior)
+            // But we can add it if needed
             const res = await this.request('POST', targetAction, payParams.toString());
 
             if (res.status === 200) {
@@ -301,7 +313,7 @@ class HidenCloudBot {
 }
 
 // ==========================================
-// Part 3: Browser Login Logic
+// Part 3: Browser Login Logic (Integrated from login.js)
 // ==========================================
 
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
@@ -316,6 +328,48 @@ function checkPort(port) {
         req.end();
     });
 }
+
+async function launchChrome() {
+    if (await checkPort(DEBUG_PORT)) {
+        console.log('Chrome 已启动。');
+        return;
+    }
+
+    console.log(`正在启动 Chrome (分离模式)...`);
+    // Use OS temp directory for user data or specific tmp path
+    const userDataDir = path.join(os.tmpdir(), 'chrome_user_data_' + Date.now());
+
+    const args = [
+        `--remote-debugging-port=${DEBUG_PORT}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-gpu',
+        '--window-size=1280,720',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-setuid-sandbox',
+        `--user-data-dir=${userDataDir}`,
+        '--disable-dev-shm-usage'
+    ];
+
+    const chrome = spawn(CHROME_PATH, args, {
+        detached: true,
+        stdio: 'ignore'
+    });
+    chrome.unref();
+
+    console.log('正在等待 Chrome 初始化...');
+    for (let i = 0; i < 20; i++) {
+        if (await checkPort(DEBUG_PORT)) break;
+        await new Promise(r => setTimeout(r, 1000));
+    }
+
+    if (!await checkPort(DEBUG_PORT)) {
+        throw new Error('Chrome 启动失败');
+    }
+}
+
 
 async function attemptTurnstileCdp(page) {
     const frames = page.frames();
@@ -412,14 +466,18 @@ async function sendTelegramNotification(summaryText) {
         const user = users[i];
         console.log(`\n=== 正在处理用户 ${i + 1}: ${user.username} ===`);
 
+        // 1. Prepare Isolated Environment
         let browser;
         let chromeProcess;
         let page;
 
         try {
+            // Launch specific Chrome for this user
+            // We use the launchChrome logic but inlined or adapted to return the process
             if (await checkPort(DEBUG_PORT)) {
                 console.log('警告: Chrome 端口似乎繁忙。正在尝试清理孤立进程...');
                 try {
+                    // Simple kill attempt for Linux/CI
                     require('child_process').execSync(`pkill -f "remote-debugging-port=${DEBUG_PORT}" || true`);
                     await sleep(2000);
                 } catch (e) { }
@@ -445,6 +503,7 @@ async function sendTelegramNotification(summaryText) {
             });
             chromeProcess.unref();
 
+            // Wait for Port
             console.log('正在等待 Chrome...');
             let portReady = false;
             for (let k = 0; k < 20; k++) {
@@ -456,6 +515,7 @@ async function sendTelegramNotification(summaryText) {
             }
             if (!portReady) throw new Error('Chrome 启动超时');
 
+            // Connect
             console.log(`正在连接到 Chrome...`);
             browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
             const defaultContext = browser.contexts()[0];
@@ -486,29 +546,9 @@ async function sendTelegramNotification(summaryText) {
             await page.getByRole('button', { name: 'Sign in to your account' }).click();
 
             try {
-                // 主要修改在这里：大幅延长等待时间 + 使用 networkidle + 额外缓冲 + 放宽判断
-                await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 120000 });
-
-                // 额外等待缓冲（应对服务器延迟或后续 JS 加载）
-                await page.waitForTimeout(30000);
-
-                const currentUrl = page.url();
-                console.log('登录后实际跳转到的完整 URL：', currentUrl);
-
-                const pageTitle = await page.title();
-                console.log('当前页面标题：', pageTitle);
-
-                // 放宽条件：只要不是登录页，且域名合理，就认为成功
-                if (!currentUrl.includes('/login') && !currentUrl.includes('/auth') &&
-                    (currentUrl.includes('dash.hidencloud.com') || currentUrl.includes('panel.hidencloud.com') ||
-                     currentUrl.includes('/dashboard') || currentUrl.includes('/panel'))) {
-                    
-                    console.log('浏览器登录成功！');
-                    loginSuccess = true;
-                } else {
-                    console.log('跳转到非预期页面，但可能已登录（请检查 URL）');
-                    loginSuccess = true;  // 强制继续，防止卡死
-                }
+                await page.waitForURL('**/dashboard', { timeout: 30000 });
+                console.log('浏览器登录成功！');
+                loginSuccess = true;
             } catch (e) {
                 console.error('等待仪表盘失败。正在检查错误...');
                 if (await page.getByText('Incorrect password').isVisible()) {
@@ -542,18 +582,21 @@ async function sendTelegramNotification(summaryText) {
             console.error(`处理用户 ${user.username} 时出错: ${err.message}`);
             if (page) await page.screenshot({ path: `error_process_${i}.png` }).catch(() => { });
         } finally {
+            // Cleanup Everything for this user
             console.log('正在清理用户环境...');
             try { if (browser) await browser.close(); } catch (e) { }
 
+            // Kill the chrome process we started
             try {
                 if (process.platform === 'win32') {
-                    require('child_process').execSync(`taskkill /F /IM chrome.exe /FI "WINDOWTITLE eq Chrome (Isolated*)" || taskkill /F /IM chrome.exe`);
+                    require('child_process').execSync(`taskkill /F /IM chrome.exe /FI "WINDOWTITLE eq Chrome (Isolated*)" || taskkill /F /IM chrome.exe`); // Imprecise on Windows but best effort
                 } else {
-                    if (chromeProcess && chromeProcess.pid) process.kill(-chromeProcess.pid, 'SIGKILL');
+                    if (chromeProcess && chromeProcess.pid) process.kill(-chromeProcess.pid, 'SIGKILL'); // If we could use pgid
                     require('child_process').execSync(`pkill -f "remote-debugging-port=${DEBUG_PORT}" || true`);
                 }
             } catch (e) { }
 
+            // Wait for port close
             await sleep(2000);
         }
     }
@@ -571,6 +614,7 @@ async function sendTelegramNotification(summaryText) {
 
     await sendTelegramNotification(summaryText);
 
+    // Exit code based on success
     if (summary.some(s => s.status.includes('Failed'))) {
         process.exit(1);
     } else {
