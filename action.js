@@ -106,7 +106,6 @@ class HidenCloudBot {
         this.logMsg.push(msg);
     }
 
-    // Wrap fetch inside the browser context
     async request(method, url, data = null, extraHeaders = {}) {
         const targetUrl = url.startsWith('http') ? url : `https://dash.hidencloud.com${url.startsWith('/') ? '' : '/'}${url}`;
 
@@ -318,45 +317,6 @@ function checkPort(port) {
     });
 }
 
-async function launchChrome() {
-    if (await checkPort(DEBUG_PORT)) {
-        console.log('Chrome 已启动。');
-        return;
-    }
-
-    console.log(`正在启动 Chrome (分离模式)...`);
-    const userDataDir = path.join(os.tmpdir(), 'chrome_user_data_' + Date.now());
-
-    const args = [
-        `--remote-debugging-port=${DEBUG_PORT}`,
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-gpu',
-        '--window-size=1280,720',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        `--user-data-dir=${userDataDir}`,
-        '--disable-dev-shm-usage'
-    ];
-
-    const chrome = spawn(CHROME_PATH, args, {
-        detached: true,
-        stdio: 'ignore'
-    });
-    chrome.unref();
-
-    console.log('正在等待 Chrome 初始化...');
-    for (let i = 0; i < 20; i++) {
-        if (await checkPort(DEBUG_PORT)) break;
-        await new Promise(r => setTimeout(r, 1000));
-    }
-
-    if (!await checkPort(DEBUG_PORT)) {
-        throw new Error('Chrome 启动失败');
-    }
-}
-
-
 async function attemptTurnstileCdp(page) {
     const frames = page.frames();
     for (const frame of frames) {
@@ -526,19 +486,28 @@ async function sendTelegramNotification(summaryText) {
             await page.getByRole('button', { name: 'Sign in to your account' }).click();
 
             try {
-                // 修改在这里：把超时从 30秒 延长到 90秒 + 额外缓冲 15秒 + 打印 URL
-                await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 90000 });
-                await page.waitForTimeout(15000);  // 额外缓冲，应对服务器延迟
+                // 主要修改在这里：大幅延长等待时间 + 使用 networkidle + 额外缓冲 + 放宽判断
+                await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 120000 });
+
+                // 额外等待缓冲（应对服务器延迟或后续 JS 加载）
+                await page.waitForTimeout(30000);
 
                 const currentUrl = page.url();
-                console.log('登录后实际跳转到的 URL：', currentUrl);
+                console.log('登录后实际跳转到的完整 URL：', currentUrl);
 
-                if (currentUrl.includes('/dashboard')) {
+                const pageTitle = await page.title();
+                console.log('当前页面标题：', pageTitle);
+
+                // 放宽条件：只要不是登录页，且域名合理，就认为成功
+                if (!currentUrl.includes('/login') && !currentUrl.includes('/auth') &&
+                    (currentUrl.includes('dash.hidencloud.com') || currentUrl.includes('panel.hidencloud.com') ||
+                     currentUrl.includes('/dashboard') || currentUrl.includes('/panel'))) {
+                    
                     console.log('浏览器登录成功！');
                     loginSuccess = true;
                 } else {
-                    console.log('跳转成功但路径不是 /dashboard，请检查是否已登录');
-                    loginSuccess = true;  // 假设已登录，继续执行后续逻辑
+                    console.log('跳转到非预期页面，但可能已登录（请检查 URL）');
+                    loginSuccess = true;  // 强制继续，防止卡死
                 }
             } catch (e) {
                 console.error('等待仪表盘失败。正在检查错误...');
